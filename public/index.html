@@ -45,6 +45,7 @@
       </div>
       <div class="row">
         <button data-action="off">OFF</button>
+        <button id="btnOff2" class="btn">OFF2 (30s)</button>
         <input id="unoRaw" placeholder="RAW к UNO: например 'SCENE 7 500 80'" />
         <button data-action="uno">UNO RAW</button>
       </div>
@@ -77,5 +78,27 @@
 
   <footer class="muted small">© lasers.drawbridge.kz</footer>
   <script src="/app.js"></script>
+  <script>
+  // где-то у тебя уже хранится выбранный device и токен:
+  const deviceId  = localStorage.getItem('device') || 'LASER_1';
+  const authToken = localStorage.getItem('AUTH_TOKEN') || '';
+
+  document.getElementById('btnOff2').addEventListener('click', async () => {
+    try {
+      const url = `/api/v1/macro/off2?device=${encodeURIComponent(deviceId)}&duration=30&step=3`;
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: authToken ? { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' } : { 'Content-Type': 'application/json' }
+      });
+      const j = await r.json();
+      if (!r.ok || j.ok === false) throw new Error(j.error || 'failed');
+      console.log('OFF2 started', j);
+      // опционально покажи тост/баннер
+      alert(`OFF2 запущен: ${j.durationSec}s, шаг ${j.stepSec}s`);
+    } catch (e) {
+      alert('Ошибка запуска OFF2: ' + e.message);
+    }
+  });
+</script>
 </body>
 </html>

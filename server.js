@@ -88,6 +88,118 @@ function pendingFromQueue(d, cursor) {
 }
 
 
+
+// ---- helpers: единообразный пуш в память + оповещение waiters (+SSE если есть) ----
+function flushToClients(deviceState, deviceId, added) {
+  // память
+  deviceState.queue.push(...added);
+  if (deviceState.queue.length > deviceState.maxQueue) {
+    deviceState.queue = deviceState.queue.slice(-deviceState.maxQueue);
+  }
+  deviceState.lastId = added[added.length - 1].id;
+
+  // HTTP long-poll waiters
+  if (deviceState.waiters.size && added.length) {
+    const payload = { events: added, cursor: String(deviceState.lastId) };
+    for (const waiter of Array.from(deviceState.waiters)) {
+      try { waiter.json(payload); } catch {}
+      deviceState.waiters.delete(waiter);
+    }
+  }
+
+  // SSE (если добавлял раньше — будет работать; если нет, можно не трогать)
+  if (deviceState.sse?.size && added.length) {
+    const line = `event: push\ndata:${JSON.stringify({ events: added, cursor: String(deviceState.lastId) })}\n\n`;
+    for (const client of Array.from(deviceState.sse)) {
+      try { client.write(line); } catch { deviceState.sse.delete(client); }
+    }
+  }
+}
+
+// ---- OFF2 macro scheduler ----
+const macroJobs = new Map(); // device -> { interval, stopTimer, idx, startedAt, stepMs, durationMs }
+
+function stopOff2(device) {
+  const job = macroJobs.get(device);
+  if (!job) return;
+  clearInterval(job.interval);
+  clearTimeout(job.stopTimer);
+  macroJobs.delete(device);
+}
+
+function startOff2(device, durationMs = 30000, stepMs = 3000) {
+  stopOff2(device); // если уже шёл — перезапустим
+
+  const d = getDevice(device);
+  const pattern = [
+    { cmd: 'RAW', raw: '1 0'  },
+    { cmd: 'RAW', raw: '50 0' },
+    { cmd: 'RAW', raw: '40 0' },
+  ];
+  let idx = 0;
+  const startedAt = Date.now();
+
+  const tick = () => {
+    const nowIso = new Date().toISOString();
+    const row = pattern[idx];
+    idx = (idx + 1) % pattern.length;
+
+    // вставляем одну команду
+    const info = qIns.run(device, nowIso, JSON.stringify(row));
+    const added = [{ id: info.lastInsertRowid, ts: nowIso, ...row }];
+
+    // отдать сразу всем слушателям
+    flushToClients(d, device, added);
+  };
+
+  // первый выстрел немедленно
+  tick();
+
+  // дальше по расписанию
+  const interval = setInterval(() => {
+    if (Date.now() - startedAt >= durationMs) return; // перестраховка, основная остановка ниже
+    tick();
+  }, stepMs);
+
+  const stopTimer = setTimeout(() => {
+    stopOff2(device);
+  }, durationMs);
+
+  macroJobs.set(device, { interval, stopTimer, idx, startedAt, stepMs, durationMs });
+
+  return {
+    startedAt: new Date(startedAt).toISOString(),
+    durationSec: Math.round(durationMs / 1000),
+    stepSec: Math.round(stepMs / 1000),
+  };
+}
+
+
+
+// POST /api/v1/macro/off2?device=ID&duration=30&step=3
+app.post('/api/v1/macro/off2', authAdmin, (req, res) => {
+  const device = String(req.query.device || '').trim();
+  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+
+  const durationSec = Number(req.query.duration ?? req.body?.duration ?? 30);
+  const stepSec     = Number(req.query.step     ?? req.body?.step     ?? 3);
+
+  const durationMs = Math.max(3, Math.min(600, durationSec)) * 1000; // 3..600 c
+  const stepMs     = Math.max(1, Math.min(60,  stepSec))     * 1000; // 1..60  c
+
+  const info = startOff2(device, durationMs, stepMs);
+  return res.json({ ok: true, macro: 'OFF2', device, ...info });
+});
+
+// DELETE /api/v1/macro/off2?device=ID
+app.delete('/api/v1/macro/off2', authAdmin, (req, res) => {
+  const device = String(req.query.device || '').trim();
+  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+  stopOff2(device);
+  res.json({ ok: true, stopped: true, macro: 'OFF2', device });
+});
+
+
 // --- Long-poll API ---
 // GET /api/v1/poll?device=ID&cursor=123&wait=25
 // Response 200: { events:[...], cursor:"<lastId>" }  OR 204 if no events within wait seconds
