@@ -27,6 +27,15 @@ const qIns   = db.prepare('INSERT INTO events (device, ts, payload) VALUES (?,?,
 const qAfter = db.prepare('SELECT id, ts, payload FROM events WHERE device=? AND id>? ORDER BY id LIMIT ?');
 const qLast  = db.prepare('SELECT COALESCE(MAX(id),0) AS lastId FROM events WHERE device=?');
 const qRecentDevices = db.prepare('SELECT device, MAX(id) AS lastId, MAX(ts) AS lastTs, COUNT(*) AS cnt FROM events GROUP BY device ORDER BY lastTs DESC LIMIT ?');
+// после остальных prepare:
+const qLastRow = db.prepare('SELECT id, ts, payload FROM events WHERE device=? ORDER BY id DESC LIMIT 1');
+
+function lastEventPayload(device) {
+  const r = qLastRow.get(device);
+  if (!r) return { events: [], cursor: '0' };
+  const ev = { id: r.id, ts: r.ts, ...JSON.parse(r.payload) };
+  return { events: [ev], cursor: String(r.id) };
+}
 
 // --- In-memory runtime state (waiters & cache) ---
 // deviceId -> { queue: [], lastId: number, lastSeenAt: number(ms), waiters: Set<res>, maxQueue: 500 }
@@ -62,28 +71,23 @@ app.get('/api/v1/poll', (req, res) => {
   const d = getDevice(device);
   d.lastSeenAt = nowMs();
 
-  // try memory cache first
-  let pending = d.queue.filter(ev => ev.id > cursor);
-  if (pending.length) {
-    return res.json({ events: pending, cursor: String(d.lastId) });
-  }
-
-  // then DB
+  // DB: новые после cursor
   const fromDb = qAfter.all(device, cursor, 200).map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
   if (fromDb.length) {
-    // also warm memory cache (tail only)
     d.queue.push(...fromDb);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
     d.lastId = fromDb[fromDb.length - 1].id;
     return res.json({ events: fromDb, cursor: String(d.lastId) });
   }
 
-  // nothing yet — hold the request (long-poll)
+  // нет новых — держим соединение и по таймауту вернем последнюю команду
   let finished = false;
   const timer = setTimeout(() => {
     finished = true;
     d.waiters.delete(res);
-    res.status(204).end();
+    // ВАЖНО: вместо 204 всегда вернуть последнюю команду устройства
+    const payload = lastEventPayload(device);
+    res.json(payload);
   }, wait * 1000);
 
   req.on('close', () => {
@@ -95,6 +99,7 @@ app.get('/api/v1/poll', (req, res) => {
 
   d.waiters.add(res);
 });
+
 
 // Push events (admin) — POST /api/v1/cmd?device=ID
 // Body: single event {cmd,...} OR {events:[...]}
