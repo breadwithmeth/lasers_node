@@ -29,6 +29,25 @@ const qLast  = db.prepare('SELECT COALESCE(MAX(id),0) AS lastId FROM events WHER
 const qRecentDevices = db.prepare('SELECT device, MAX(id) AS lastId, MAX(ts) AS lastTs, COUNT(*) AS cnt FROM events GROUP BY device ORDER BY lastTs DESC LIMIT ?');
 // после остальных prepare:
 const qLastRow = db.prepare('SELECT id, ts, payload FROM events WHERE device=? ORDER BY id DESC LIMIT 1');
+// ДОБАВЬ рядом с остальными prepare:
+const qAfterAct = db.prepare(`
+  SELECT id, ts, payload FROM events
+  WHERE device=? AND id>? AND json_extract(payload,'$.cmd')!='GET'
+  ORDER BY id LIMIT ?
+`);
+const qLastAct = db.prepare(`
+  SELECT id, ts, payload FROM events
+  WHERE device=? AND json_extract(payload,'$.cmd')!='GET'
+  ORDER BY id DESC LIMIT 1
+`);
+
+function lastActionablePayload(device) {
+  const anyLast = qLast.get(device).lastId;                // общий последний id (включая GET)
+  const r = qLastAct.get(device);                          // последний НЕ-GET
+  if (!r) return { events: [], cursor: String(anyLast) };
+  const ev = { id: r.id, ts: r.ts, ...JSON.parse(r.payload) };
+  return { events: [ev], cursor: String(anyLast) };
+}
 
 function lastEventPayload(device) {
   const r = qLastRow.get(device);
@@ -58,45 +77,56 @@ function authAdmin(req, res, next) {
   next();
 }
 
+
+function pendingFromQueue(d, cursor) {
+  if (!d.queue.length) return [];
+  // бинарный поиск по id
+  let lo = 0, hi = d.queue.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; (d.queue[mid].id <= cursor) ? lo = mid + 1 : hi = mid; }
+  // ⚠️ убираем GET
+  return d.queue.slice(lo).filter(ev => ev.cmd !== 'GET');
+}
+
+
 // --- Long-poll API ---
 // GET /api/v1/poll?device=ID&cursor=123&wait=25
 // Response 200: { events:[...], cursor:"<lastId>" }  OR 204 if no events within wait seconds
 app.get('/api/v1/poll', (req, res) => {
   const device = String(req.query.device || '').trim();
-  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+  if (!device) return res.status(400).json({ ok:false, error:'device required' });
   const wait = Math.max(5, Math.min(60, parseInt(req.query.wait || '25', 10)));
-  const cursorRaw = String(req.query.cursor || '').trim();
-  const cursor = cursorRaw ? parseInt(cursorRaw, 10) : 0;
+  const cursor = parseInt(String(req.query.cursor || '0'), 10) || 0;
 
   const d = getDevice(device);
   d.lastSeenAt = nowMs();
 
-  // DB: новые после cursor
-  const fromDb = qAfter.all(device, cursor, 200).map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
+  // 1) быстрый путь из памяти (без GET)
+  const mem = pendingFromQueue(d, cursor);
+  if (mem.length) {
+    // cursor возвращаем как общий последний id (даже если это был GET)
+    const anyLast = qLast.get(device).lastId;
+    return res.json({ events: mem, cursor: String(anyLast) });
+  }
+
+  // 2) БД (без GET)
+  const fromDb = qAfterAct.all(device, cursor, 200).map(r => ({ id:r.id, ts:r.ts, ...JSON.parse(r.payload) }));
   if (fromDb.length) {
     d.queue.push(...fromDb);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
-    d.lastId = fromDb[fromDb.length - 1].id;
-    return res.json({ events: fromDb, cursor: String(d.lastId) });
+    // d.lastId оставь как есть — он обновляется при вставках /cmd
+    const anyLast = qLast.get(device).lastId;
+    return res.json({ events: fromDb, cursor: String(anyLast) });
   }
 
-  // нет новых — держим соединение и по таймауту вернем последнюю команду
+  // 3) Таймаут: вернуть последнюю НЕ-GET
   let finished = false;
   const timer = setTimeout(() => {
-    finished = true;
-    d.waiters.delete(res);
-    // ВАЖНО: вместо 204 всегда вернуть последнюю команду устройства
-    const payload = lastEventPayload(device);
-    res.json(payload);
+    finished = true; d.waiters.delete(res);
+    const payload = lastActionablePayload(device);
+    res.json(payload); // никогда не 204
   }, wait * 1000);
 
-  req.on('close', () => {
-    if (!finished) {
-      clearTimeout(timer);
-      d.waiters.delete(res);
-    }
-  });
-
+  req.on('close', () => { if (!finished) { clearTimeout(timer); d.waiters.delete(res); } });
   d.waiters.add(res);
 });
 
@@ -130,17 +160,17 @@ app.post('/api/v1/cmd', authAdmin, (req, res) => {
 
   // memory tail cache
   d.queue.push(...added);
-  if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
-  d.lastId = added[added.length - 1].id;
+if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
+d.lastId = added[added.length - 1].id;
 
-  // flush all waiters now
-  if (d.waiters.size) {
-    const payload = { events: added, cursor: String(d.lastId) };
-    for (const waiter of Array.from(d.waiters)) {
-      try { waiter.json(payload); } catch (_) {}
-      d.waiters.delete(waiter);
-    }
-  }
+// отдать только actionable
+const actionable = added.filter(ev => ev.cmd !== 'GET');
+
+// flush http waiters
+if (d.waiters.size && actionable.length) {
+  const payload = { events: actionable, cursor: String(qLast.get(device).lastId) };
+  for (const waiter of Array.from(d.waiters)) { try { waiter.json(payload); } catch {} d.waiters.delete(waiter); }
+}
 
   res.json({ ok: true, added });
 });
