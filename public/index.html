@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0b0c" />
+  <title>Lasers Control</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Lasers Control</h1>
+    <div id="status">—</div>
+  </header>
+
+  <main class="grid">
+    <section class="card">
+      <h2>Устройство</h2>
+      <div class="row">
+        <label for="device">Device ID</label>
+        <input id="device" placeholder="wemos-abc123" />
+        <button id="refresh">Обновить список</button>
+      </div>
+      <div id="devices" class="muted small"></div>
+    </section>
+
+    <section class="card">
+      <h2>Сцены / DMX</h2>
+      <div class="row">
+        <label>SCENE N</label>
+        <input id="sceneN" type="number" min="1" max="99" value="5" inputmode="numeric" />
+        <input id="sceneArgs" placeholder="опц. параметры, напр. 3000 80" />
+        <button data-action="scene">Отправить</button>
+      </div>
+      <div class="row">
+        <label>Ширина W</label>
+        <input id="wVal" type="number" min="0" max="255" value="180" inputmode="numeric" />
+        <button data-action="w">W</button>
+        <label>Мин</label>
+        <input id="wMin" type="number" min="0" max="255" value="120" inputmode="numeric" />
+        <button data-action="wmin">WMIN</button>
+        <label>Макс</label>
+        <input id="wMax" type="number" min="0" max="255" value="240" inputmode="numeric" />
+        <button data-action="wmax">WMAX</button>
+      </div>
+      <div class="row">
+        <button data-action="off">OFF</button>
+        <input id="unoRaw" placeholder="RAW к UNO: например 'SCENE 7 500 80'" />
+        <button data-action="uno">UNO RAW</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Звонки</h2>
+      <div class="row">
+        <input id="phone" placeholder="+7708…" inputmode="tel" />
+        <button data-action="call">Позвонить</button>
+        <button data-action="hang">Положить</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>SIM808 Питание</h2>
+      <div class="row">
+        <button data-action="sim_on">SIM ON</button>
+        <button data-action="sim_toggle">SIM TOGGLE</button>
+        <label>pulse_ms</label>
+        <input id="pulse" type="number" min="200" max="5000" value="1800" inputmode="numeric" />
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Лог отправок</h2>
+      <pre id="log" class="log" aria-live="polite"></pre>
+    </section>
+  </main>
+
+  <footer class="muted small">© lasers.drawbridge.kz</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

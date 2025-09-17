@@ -1,0 +1,5 @@
+/.env
+/events.db
+/events.db-shm
+/events.db-wal
+/node_modules

@@ -1,0 +1,61 @@
+:root {
+  --bg: #0b0b0c; --card: #121316; --text: #e8e8ea; --muted: #9aa0a6; --accent: #56b;
+  --ok: #18a558; --err: #d33; --border: #1f2024; --radius: 16px; --space: 16px;
+}
+
+*{box-sizing:border-box}
+html{height:100%; -webkit-text-size-adjust:100%}
+body{margin:0; height:100%; background:var(--bg); color:var(--text);
+  font: clamp(14px, 1.6vw, 16px)/1.45 system-ui, -apple-system, Segoe UI, Roboto, Arial;}
+button,input,select{font:inherit}
+
+/* Header */
+header{position:sticky; top:0; z-index:10; display:flex; gap:10px; justify-content:space-between; align-items:center;
+  padding:12px 16px; border-bottom:1px solid var(--border);
+  background:color-mix(in oklab, var(--bg) 92%, black 8%);
+  backdrop-filter:saturate(1.2) blur(8px)}
+h1{margin:0; font-size:clamp(18px, 2.4vw, 22px)}
+#status{color:var(--muted)}
+
+/* Layout */
+.grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; padding:16px}
+.card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+  padding:16px; box-shadow:0 8px 24px rgba(0,0,0,.25)}
+
+/* Form rows */
+.row{display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:10px 0}
+label{color:var(--muted)}
+input{background:#0e0f12; border:1px solid #2a2b30; color:var(--text); border-radius:12px; padding:10px 12px;
+  min-width:0}
+input::placeholder{color:#6b7280}
+
+button{background:#10131a; border:1px solid #2a2f3a; color:var(--text); padding:10px 14px; border-radius:12px; cursor:pointer;
+  transition:transform .02s ease, border-color .2s, background .2s}
+button:hover{border-color:#3b4252}
+button:active{transform:scale(.98)}
+button.primary{background:linear-gradient(180deg, #152238, #10131a); border-color:#2b3f63}
+
+.muted{color:var(--muted)}
+.small{font-size:12px}
+.log{background:#0a0b0d; border:1px solid var(--border); border-radius:12px; min-height:180px; padding:10px; overflow:auto}
+
+/* Mobile-first tweaks */
+@media (max-width: 720px) {
+  .grid{grid-template-columns:1fr; gap:12px; padding:12px}
+  .card{padding:14px; border-radius:20px}
+  .row{flex-direction:column; align-items:stretch}
+  input, button, select { width:100%; min-height:44px; }
+  label{font-size:13px}
+  header{padding:10px 12px}
+}
+
+/* Larger screens */
+@media (min-width: 1080px) {
+  .grid{grid-template-columns:repeat(2, minmax(380px, 1fr));}
+}
+
+/* iOS safe areas */
+@supports(padding:max(0px)){
+  header{padding-left:max(12px, env(safe-area-inset-left)); padding-right:max(12px, env(safe-area-inset-right));}
+  body{padding-bottom:env(safe-area-inset-bottom)}
+}
