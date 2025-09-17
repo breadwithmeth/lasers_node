@@ -90,7 +90,7 @@ function startOffMacro(device) {
   const timers = [];
   // шаги: t=0, +20с, +40с, +60с, +80с
   const steps = [
-    { delay: 0,      row: { cmd: 'SCENE', val: 1 } }, // сразу
+    { delay: 0,      row: { cmd: 'SCENE 1', val: 1 } }, // сразу
     { delay: 20000,  row: { cmd: 'RAW',   raw: '1 0' } },
     { delay: 40000,  row: { cmd: 'RAW',   raw: '40 0' } },
     { delay: 60000,  row: { cmd: 'RAW',   raw: '50 0' } },
