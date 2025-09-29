@@ -115,6 +115,7 @@ function startOffMacro(device) {
 app.get('/api/v1/poll', (req, res) => {
   const device = String(req.query.device || '').trim();
   if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+
   const wait = Math.max(5, Math.min(60, parseInt(req.query.wait || '25', 10)));
   const cursorRaw = String(req.query.cursor || '').trim();
   const cursor = cursorRaw ? parseInt(cursorRaw, 10) : 0;
@@ -122,23 +123,30 @@ app.get('/api/v1/poll', (req, res) => {
   const d = getDevice(device);
   d.lastSeenAt = nowMs();
 
-  // try memory cache first (если нужно — раскомментируй)
+  // --- если решите снова использовать память, сразу берём последнюю ---
   // const pending = d.queue.filter(ev => ev.id > cursor);
   // if (pending.length) {
-  //   return res.json({ events: pending, cursor: String(d.lastId) });
+  //   const lastEv = pending[pending.length - 1];
+  //   d.lastId = lastEv.id;
+  //   return res.json({ events: [lastEv], cursor: String(d.lastId) });
   // }
 
-  // DB
-  const fromDb = qAfter.all(device, cursor, 200).map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
+  // --- DB: берём пачку и возвращаем только последнюю ---
+  const fromDb = qAfter.all(device, cursor, 200)
+    .map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
+
   if (fromDb.length) {
-    // warm memory cache (tail)
-    d.queue.push(...fromDb);
+    const lastEv = fromDb[fromDb.length - 1];
+
+    // подогреваем in-memory хвост только последним (не обязательно, но аккуратнее по памяти)
+    d.queue.push(lastEv);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
-    d.lastId = fromDb[fromDb.length - 1].id;
-    return res.json({ events: fromDb, cursor: String(d.lastId) });
+
+    d.lastId = lastEv.id;
+    return res.json({ events: [lastEv], cursor: String(d.lastId) });
   }
 
-  // nothing yet — hold the request (long-poll)
+  // --- ничего нет — держим соединение (long-poll) ---
   let finished = false;
   const timer = setTimeout(() => {
     finished = true;
@@ -155,6 +163,7 @@ app.get('/api/v1/poll', (req, res) => {
 
   d.waiters.add(res);
 });
+
 
 // Push events (admin) — POST /api/v1/cmd?device=ID
 // Body: single event {cmd,...} OR {events:[...]}
