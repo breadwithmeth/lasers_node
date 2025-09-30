@@ -255,20 +255,17 @@ app.get('/api/v1/poll', async (req, res) => {
   });
 
   if (lastRow) {
-    const lastEv = { id: lastRow.id, ts: lastRow.ts, ...JSON.parse(lastRow.payload) };
+    const payload = JSON.parse(lastRow.payload);
+    // Преобразуем SCENE val -> args если нужно под формат примера
+    if (payload && payload.cmd === 'SCENE' && payload.val != null && payload.args === undefined) {
+      payload.args = String(payload.val);
+      delete payload.val; // чтобы не дублировать
+    }
+    const lastEv = { id: lastRow.id, ts: lastRow.ts, ...payload };
     d.queue.push(lastEv);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
     d.lastId = lastEv.id;
-    // Формируем «обрезанный» ответ без id/ts/cursor
-    const { cmd, args, val, num, raw, ...rest } = lastEv;
-    const sanitized = {};
-    if (cmd !== undefined) sanitized.cmd = cmd;
-    if (args !== undefined) sanitized.args = args;
-    if (val !== undefined) sanitized.val = val;
-    if (num !== undefined) sanitized.num = num;
-    if (raw !== undefined) sanitized.raw = raw;
-    // rest содержит служебные поля (id, ts) игнорируем по задаче
-    return res.json({ events: [sanitized] });
+    return res.json({ events: [lastEv], cursor: String(d.lastId) });
   }
 
   // --- ничего нет — держим соединение (long-poll) ---
@@ -276,8 +273,7 @@ app.get('/api/v1/poll', async (req, res) => {
   const timer = setTimeout(() => {
     finished = true;
     d.waiters.delete(res);
-    // Вместо 204 всегда возвращаем одинаковый формат
-    res.json({ events: [] });
+    res.json({ events: [], cursor: String(cursor) });
   }, wait * 1000);
 
   req.on('close', () => {
