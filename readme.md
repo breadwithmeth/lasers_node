@@ -1,13 +1,28 @@
-# lasers.drawbridge.kz — Simple Web + API for ESP8266 Long‑Polling
+# 🚀 Lasers Drawbridge WebApp — ESP8266 Long‑Polling API
 
-A minimal production‑ready Node.js app that:
+A modern production‑ready Node.js app with **Prisma ORM** that:
 
-* Serves a clean web UI to send commands to your WeMos/ESP devices
-* Exposes a **long‑poll API** compatible with your firmware (`/api/v1/poll`)
-* Tracks devices (last seen, pending requests) in memory
-* Supports batch commands and a simple auth token for admin endpoints
+* 🎯 Serves a clean web UI to send commands to your WeMos/ESP devices
+* 📡 Exposes a **long‑poll API** compatible with your firmware (`/api/v1/poll`)
+* 📊 Tracks devices and events with **SQLite + Prisma** for persistence
+* 🔒 Supports batch commands and auth token for admin endpoints
+* ⚡ **NEW**: Migrated to Prisma ORM for better performance and type safety
 
-> Stack: Node.js (Express), vanilla HTML/CSS/JS. No DB required for a start.
+> **Stack**: Node.js (Express), Prisma ORM, SQLite, vanilla HTML/CSS/JS
+
+## 📦 Quick Start
+
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Setup database
+npm run db:push
+
+# 3. Start server
+npm start
+# Server runs on http://localhost:8080
+```
 
 ---
 
@@ -22,6 +37,29 @@ lasers-app/
     index.html
     app.js
     styles.css
+
+### Coordinates (Device Model)
+Актуальная модель устройства теперь использует географические поля `lat` и `lon` вместо устаревших `x,y,z`.
+
+Пример (Prisma schema):
+```prisma
+model Device {
+  id         String   @id
+  lat        Float?
+  lon        Float?
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  events     Event[]
+}
+```
+
+PUT /api/v1/device/:id (admin) — создание/обновление координат:
+```json
+{ "lat": 51.509865, "lon": -0.118092 }
+```
+
+При отсутствии устройства — создаётся автоматически. `lastSeenAt` реплицируется от последнего poll.
 ```
 
 ---
@@ -35,15 +73,48 @@ lasers-app/
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
+    "@prisma/client": "^6.16.2",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "prisma": "^6.16.2"
   }
 }
+```
+
+## 🗄️ Database Management
+
+```bash
+# Generate Prisma Client (after schema changes)
+npm run db:generate
+
+# Push schema changes to database
+npm run db:push
+
+# Create and apply migration
+npx prisma migrate dev --name migration_name
+
+# Open Prisma Studio (database GUI)
+npm run db:studio
+```
+
+## 🔧 Environment Variables
+
+Create `.env` file:
+```bash
+# Server configuration
+PORT=8080
+AUTH_TOKEN=your-secret-token-here
+
+# Database (Prisma)
+DATABASE_URL="file:./events.db"
 ```
 
 ---

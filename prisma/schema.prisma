@@ -1,0 +1,69 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Event {
+  id      Int    @id @default(autoincrement())
+  device  String
+  deviceRef Device? @relation(fields: [device], references: [id])
+  ts      String
+  payload String
+
+  @@index([device, id])
+}
+
+model User {
+  id          Int      @id @default(autoincrement())
+  username    String   @unique
+  email       String   @unique
+  passwordHash String
+  role        String   @default("admin") // admin, superadmin
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  lastLoginAt DateTime?
+  createdById Int?     // кто создал пользователя
+  createdBy   User?    @relation("UserCreatedBy", fields: [createdById], references: [id])
+  createdUsers User[]  @relation("UserCreatedBy")
+
+  @@index([username])
+  @@index([email])
+}
+
+// Устройства (лазеры) с координатами
+model Device {
+  id        String  @id // совпадает со значением поля Event.device
+  lat       Float? // широта
+  lon       Float? // долгота
+  lastSeenAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  events    Event[]
+  schedules DeviceSchedule[]
+}
+
+// Расписания включения сцен для устройств
+model DeviceSchedule {
+  id          Int      @id @default(autoincrement())
+  deviceId    String?  // null = применяется ко всем (wildcard)
+  device      Device?  @relation(fields: [deviceId], references: [id])
+  windowStart Int      // минуты от полуночи (0..1439)
+  windowEnd   Int      // минуты от полуночи (0..1439); если <= windowStart => окно через полночь
+  sceneCmd    String   @default("SCENE 1")
+  offMode     String   @default("OFF") // OFF или SCENE_OFF
+  priority    Int      @default(0)      // больше = важнее
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([deviceId, enabled])
+  @@index([priority])
+}

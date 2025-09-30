@@ -2,52 +2,95 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const Database = require('better-sqlite3');
+const { PrismaClient } = require('@prisma/client');
+const AuthUtils = require('./utils/auth');
+const UserService = require('./services/UserService');
 
 const app = express();
 app.set('trust proxy', true);
 app.use(express.json({ limit: '256kb' }));
 app.use(cors());
 
-// --- SQLite ---
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'events.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.exec(`
-CREATE TABLE IF NOT EXISTS events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  device TEXT NOT NULL,
-  ts     TEXT NOT NULL,
-  payload TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_device_id ON events(device, id);
-`);
-
-const qIns   = db.prepare('INSERT INTO events (device, ts, payload) VALUES (?,?,?)');
-const qAfter = db.prepare('SELECT id, ts, payload FROM events WHERE device=? AND id>? ORDER BY id LIMIT ?');
-const qLast  = db.prepare('SELECT COALESCE(MAX(id),0) AS lastId FROM events WHERE device=?');
-const qRecentDevices = db.prepare('SELECT device, MAX(id) AS lastId, MAX(ts) AS lastTs, COUNT(*) AS cnt FROM events GROUP BY device ORDER BY lastTs DESC LIMIT ?');
+// --- Prisma ---
+const prisma = new PrismaClient();
+const userService = new UserService(prisma);
 
 // --- In-memory runtime state (waiters & cache) ---
 // deviceId -> { queue: [], lastId: number, lastSeenAt: number(ms), waiters: Set<res>, maxQueue: 500 }
 const devices = new Map();
 function nowMs() { return Date.now(); }
-function getDevice(id) {
+async function getDevice(id) {
   if (!devices.has(id)) {
-    const lastId = qLast.get(id).lastId;
-    devices.set(id, { queue: [], lastId, lastSeenAt: 0, waiters: new Set(), maxQueue: 500 });
+    // Создаём/обновляем запись устройства (upsert: если нет — создаём)
+    const deviceRow = await prisma.device.upsert({
+      where: { id },
+      update: { lastSeenAt: new Date() },
+      create: { id }
+    });
+
+    const lastEvent = await prisma.event.findFirst({
+      where: { device: id },
+      orderBy: { id: 'desc' },
+      select: { id: true }
+    });
+    const lastId = lastEvent?.id || 0;
+    devices.set(id, { queue: [], lastId, lastSeenAt: deviceRow.lastSeenAt.getTime(), waiters: new Set(), maxQueue: 500 });
   }
   return devices.get(id);
 }
 
+// Legacy auth (для обратной совместимости)
 function authAdmin(req, res, next) {
   const need = process.env.AUTH_TOKEN;
-  if (!need) return next();
+  if (!need) return authJWT(req, res, next); // Переходим на JWT если токен не настроен
   const hdr = req.get('Authorization') || '';
   const ok = hdr === `Bearer ${need}`;
-  if (!ok) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  if (!ok) return authJWT(req, res, next); // Пробуем JWT если legacy токен не подошел
   next();
+}
+
+// JWT аутентификация
+async function authJWT(req, res, next) {
+  try {
+    const authHeader = req.get('Authorization') || '';
+    
+    if (!authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ ok: false, error: 'Требуется токен авторизации' });
+    }
+    
+    const token = authHeader.slice(7);
+    const decoded = AuthUtils.verifyToken(token);
+    
+    if (!decoded) {
+      return res.status(401).json({ ok: false, error: 'Недействительный токен' });
+    }
+    
+    const user = await userService.getUserById(decoded.userId);
+    
+    if (!user || !user.isActive) {
+      return res.status(401).json({ ok: false, error: 'Пользователь не найден или неактивен' });
+    }
+    
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ ok: false, error: 'Ошибка авторизации' });
+  }
+}
+
+// Проверка роли (для будущего расширения)
+function requireRole(roles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ ok: false, error: 'Требуется авторизация' });
+    }
+    
+    if (Array.isArray(roles) ? !roles.includes(req.user.role) : req.user.role !== roles) {
+      return res.status(403).json({ ok: false, error: 'Недостаточно прав доступа' });
+    }
+    
+    next();
+  };
 }
 
 // ---- утилиты рассылки ----
@@ -67,11 +110,17 @@ function flushToClients(d, device, added) {
   }
 }
 
-function insertOne(device, row) {
-  const d = getDevice(device);
+async function insertOne(device, row) {
+  const d = await getDevice(device);
   const ts = new Date().toISOString();
-  const info = qIns.run(device, ts, JSON.stringify(row));
-  const ev = { id: info.lastInsertRowid, ts, ...row };
+  const event = await prisma.event.create({
+    data: {
+      device,
+      ts,
+      payload: JSON.stringify(row)
+    }
+  });
+  const ev = { id: event.id, ts, ...row };
   flushToClients(d, device, [ev]);
   return ev;
 }
@@ -98,7 +147,7 @@ function startOffMacro(device) {
   ];
 
   for (const s of steps) {
-    timers.push(setTimeout(() => insertOne(device, s.row), s.delay));
+    timers.push(setTimeout(async () => await insertOne(device, s.row), s.delay));
   }
   offMacroTimers.set(device, timers);
 
@@ -112,7 +161,7 @@ function startOffMacro(device) {
 // --- Long-poll API ---
 // GET /api/v1/poll?device=ID&cursor=123&wait=25
 // Response 200: { events:[...], cursor:"<lastId>" }  OR 204 if no events within wait seconds
-app.get('/api/v1/poll', (req, res) => {
+app.get('/api/v1/poll', async (req, res) => {
   const device = String(req.query.device || '').trim();
   if (!device) return res.status(400).json({ ok: false, error: 'device required' });
 
@@ -120,8 +169,13 @@ app.get('/api/v1/poll', (req, res) => {
   const cursorRaw = String(req.query.cursor || '').trim();
   const cursor = cursorRaw ? parseInt(cursorRaw, 10) : 0;
 
-  const d = getDevice(device);
+  const d = await getDevice(device);
   d.lastSeenAt = nowMs();
+  // Обновляем lastSeenAt в БД асинхронно (не блокируем ответ)
+  prisma.device.update({
+    where: { id: device },
+    data: { lastSeenAt: new Date() }
+  }).catch(() => {});
 
   // --- если решите снова использовать память, сразу берём последнюю ---
   // const pending = d.queue.filter(ev => ev.id > cursor);
@@ -132,11 +186,23 @@ app.get('/api/v1/poll', (req, res) => {
   // }
 
   // --- DB: берём пачку и возвращаем только последнюю ---
-  const fromDb = qAfter.all(device, cursor, 200)
-    .map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
+  const fromDb = await prisma.event.findMany({
+    where: {
+      device,
+      id: { gt: cursor }
+    },
+    orderBy: { id: 'asc' },
+    take: 200
+  });
 
-  if (fromDb.length) {
-    const lastEv = fromDb[fromDb.length - 1];
+  const mappedEvents = fromDb.map(r => ({ 
+    id: r.id, 
+    ts: r.ts, 
+    ...JSON.parse(r.payload) 
+  }));
+
+  if (mappedEvents.length) {
+    const lastEv = mappedEvents[mappedEvents.length - 1];
 
     // подогреваем in-memory хвост только последним (не обязательно, но аккуратнее по памяти)
     d.queue.push(lastEv);
@@ -167,10 +233,10 @@ app.get('/api/v1/poll', (req, res) => {
 
 // Push events (admin) — POST /api/v1/cmd?device=ID
 // Body: single event {cmd,...} OR {events:[...]}
-app.post('/api/v1/cmd', authAdmin, (req, res) => {
+app.post('/api/v1/cmd', authAdmin, async (req, res) => {
   const device = String(req.query.device || '').trim();
   if (!device) return res.status(400).json({ ok: false, error: 'device required' });
-  const d = getDevice(device);
+  const d = await getDevice(device);
 
   const body = req.body || {};
   let incoming = [];
@@ -207,10 +273,18 @@ app.post('/api/v1/cmd', authAdmin, (req, res) => {
 
   // Записываем оставшиеся команды одной пачкой на один таймстемп
   const nowIso = new Date().toISOString();
-  const added = normalized.map(row => {
-    const info = qIns.run(device, nowIso, JSON.stringify(row));
-    return { id: info.lastInsertRowid, ts: nowIso, ...row };
-  });
+  const added = [];
+  
+  for (const row of normalized) {
+    const event = await prisma.event.create({
+      data: {
+        device,
+        ts: nowIso,
+        payload: JSON.stringify(row)
+      }
+    });
+    added.push({ id: event.id, ts: nowIso, ...row });
+  }
 
   if (added.length) {
     flushToClients(d, device, added);
@@ -219,38 +293,601 @@ app.post('/api/v1/cmd', authAdmin, (req, res) => {
   res.json({ ok: true, added, macro: macroTriggered ? 'OFF_SEQUENCE' : undefined });
 });
 
+// === Convenience command endpoints ===
+// OFF macro trigger
+app.post('/api/v1/device/:id/off', authAdmin, async (req, res) => {
+  const device = req.params.id.trim();
+  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+  // Запускаем макрос (он сам создаст последовательность событий)
+  const macro = startOffMacro(device);
+  return res.json({ ok: true, macro });
+});
+
+// SCENE 1 или SCENE 2 (ограниченно по задаче)
+app.post('/api/v1/device/:id/scene/:n', authAdmin, async (req, res) => {
+  const device = req.params.id.trim();
+  const n = parseInt(req.params.n, 10);
+  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+  if (![1, 2].includes(n)) return res.status(400).json({ ok: false, error: 'only SCENE 1 or 2 allowed' });
+  // Любая явная команда отменяет OFF-макрос
+  cancelOffMacro(device);
+  try {
+    const ev = await insertOne(device, { cmd: 'SCENE', val: n });
+    return res.json({ ok: true, event: ev });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Custom single command (унифицированный, аналог одного элемента POST /api/v1/cmd)
+app.post('/api/v1/device/:id/custom', authAdmin, async (req, res) => {
+  const device = req.params.id.trim();
+  if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+  const body = req.body || {};
+  if (!body.cmd) return res.status(400).json({ ok: false, error: 'cmd required' });
+  const cmd = String(body.cmd).toUpperCase();
+  if (cmd === 'OFF') {
+    // перенаправляем на макрос, чтобы поведение было идентичным
+    const macro = startOffMacro(device);
+    return res.json({ ok: true, macro });
+  }
+  // Отмена OFF если что-то иное
+  cancelOffMacro(device);
+  const row = {
+    cmd,
+    args: body.args ?? undefined,
+    val: body.val ?? undefined,
+    num: body.num ?? undefined,
+    raw: body.raw ?? undefined
+  };
+  try {
+    const ev = await insertOne(device, row);
+    return res.json({ ok: true, event: ev });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Simple device list (from DB + runtime lastSeen)
-app.get('/api/v1/devices', authAdmin, (_req, res) => {
-  const rows = qRecentDevices.all(200);
-  const list = rows.map(r => ({
-    id: r.device,
-    lastSeenAt: devices.get(r.device)?.lastSeenAt || 0,
-    queueLen: devices.get(r.device)?.queue.length || 0,
-    lastId: r.lastId,
-    lastEventAt: r.lastTs
-  }));
+app.get('/api/v1/devices', authAdmin, async (_req, res) => {
+  // Берём данные об устройствах
+  const deviceRows = await prisma.device.findMany({
+    orderBy: { lastSeenAt: 'desc' },
+    take: 500
+  });
+
+  // Агрегируем события (максимальный id и ts) для устройств
+  const eventAgg = await prisma.event.groupBy({
+    by: ['device'],
+    _max: { id: true, ts: true }
+  });
+  const aggMap = new Map(eventAgg.map(a => [a.device, a]));
+
+  // Загружаем enabled расписания для подсчёта признаков
+  const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
+  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
+
+  const list = deviceRows.map(dv => {
+    const agg = aggMap.get(dv.id);
+    const runtime = devices.get(dv.id);
+    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === dv.id);
+    const hasSchedule = rulesFor.length > 0;
+    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+    return {
+      id: dv.id,
+      lat: dv.lat,
+      lon: dv.lon,
+      lastSeenAt: dv.lastSeenAt.getTime(),
+      lastId: agg?._max.id || 0,
+      lastEventAt: agg?._max.ts || null,
+      queueLen: runtime?.queue.length || 0,
+      scheduleHas: hasSchedule,
+      scheduleActive
+    };
+  });
+
   res.json({ devices: list });
 });
 
 // Recent events for a device (DB)
-app.get('/api/v1/events', authAdmin, (req, res) => {
+app.get('/api/v1/events', authAdmin, async (req, res) => {
   const device = String(req.query.device || '').trim();
   if (!device) return res.status(400).json({ ok: false, error: 'device required' });
   const cursor = parseInt(String(req.query.cursor || '0'), 10) || 0;
   const limit = Math.max(1, Math.min(500, parseInt(String(req.query.limit || '100'), 10)));
-  const rows = qAfter.all(device, cursor, limit).map(r => ({ id: r.id, ts: r.ts, ...JSON.parse(r.payload) }));
-  const lastId = rows.length ? rows[rows.length - 1].id : qLast.get(device).lastId;
+  
+  const events = await prisma.event.findMany({
+    where: {
+      device,
+      id: { gt: cursor }
+    },
+    orderBy: { id: 'asc' },
+    take: limit
+  });
+  
+  const rows = events.map(r => ({ 
+    id: r.id, 
+    ts: r.ts, 
+    ...JSON.parse(r.payload) 
+  }));
+  
+  const lastEvent = await prisma.event.findFirst({
+    where: { device },
+    orderBy: { id: 'desc' },
+    select: { id: true }
+  });
+  
+  const lastId = rows.length ? rows[rows.length - 1].id : (lastEvent?.id || 0);
   res.json({ events: rows, cursor: String(lastId) });
+});
+
+// === USER MANAGEMENT API ===
+// === DEVICE MANAGEMENT API ===
+
+// Получить одно устройство
+app.get('/api/v1/device/:id', authAdmin, async (req, res) => {
+  const id = req.params.id;
+  const dev = await prisma.device.findUnique({ where: { id } });
+  if (!dev) return res.status(404).json({ ok: false, error: 'device not found' });
+  const agg = await prisma.event.findFirst({ where: { device: id }, orderBy: { id: 'desc' }, select: { id: true, ts: true } });
+  const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true, OR: [ { deviceId: id }, { deviceId: null } ] }, orderBy: { priority: 'desc' } });
+  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
+  const hasSchedule = schedRules.length>0;
+  const scheduleActive = hasSchedule && schedRules.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+  res.json({
+    ok: true,
+    device: {
+      id: dev.id,
+      lat: dev.lat,
+      lon: dev.lon,
+      lastSeenAt: dev.lastSeenAt.getTime(),
+      lastId: agg?.id || 0,
+      lastEventAt: agg?.ts || null,
+      scheduleHas: hasSchedule,
+      scheduleActive
+    }
+  });
+});
+
+// Обновить координаты устройства (partial)
+app.put('/api/v1/device/:id', authAdmin, async (req, res) => {
+  const id = req.params.id;
+  const { lat, lon } = req.body || {};
+  try {
+    const dev = await prisma.device.upsert({
+      where: { id },
+      update: { lat, lon },
+      create: { id, lat, lon }
+    });
+    res.json({ ok: true, device: dev });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Список устройств с координатами (пагинация упрощённо)
+app.get('/api/v1/device', authAdmin, async (req, res) => {
+  const list = await prisma.device.findMany({ orderBy: { lastSeenAt: 'desc' }, take: 500 });
+  res.json({ ok: true, devices: list });
+});
+
+// Упрощённый список устройств только с координатами (для карт / геоинтерфейсов)
+app.get('/api/v1/devices/coords', authAdmin, async (_req, res) => {
+  const devicesRows = await prisma.device.findMany({
+    orderBy: { lastSeenAt: 'desc' },
+    take: 1000,
+    select: { id: true, lat: true, lon: true, lastSeenAt: true }
+  });
+  const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
+  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
+  const mapped = devicesRows.map(d => {
+    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === d.id);
+    const hasSchedule = rulesFor.length>0;
+    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+    return {
+      id: d.id,
+      lat: d.lat,
+      lon: d.lon,
+      lastSeenAt: d.lastSeenAt.getTime(),
+      scheduleHas: hasSchedule,
+      scheduleActive
+    };
+  });
+  res.json({ devices: mapped });
+});
+
+// Аутентификация пользователя
+app.post('/api/v1/auth/login', async (req, res) => {
+  try {
+    const { login, password } = req.body;
+    
+    if (!login || !password) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Требуется логин и пароль' 
+      });
+    }
+    
+    const user = await userService.authenticateUser(login, password);
+    const token = AuthUtils.generateToken(user);
+    
+    res.json({
+      ok: true,
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    res.status(401).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Получение информации о текущем пользователе
+app.get('/api/v1/auth/me', authJWT, (req, res) => {
+  res.json({
+    ok: true,
+    user: {
+      id: req.user.id,
+      username: req.user.username,
+      email: req.user.email,
+      role: req.user.role,
+      lastLoginAt: req.user.lastLoginAt
+    }
+  });
+});
+
+// Создание нового пользователя
+app.post('/api/v1/users', authJWT, async (req, res) => {
+  try {
+    const { username, email, password, role } = req.body;
+    
+    if (!username || !email || !password) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Требуются поля: username, email, password' 
+      });
+    }
+    
+    const user = await userService.createUser(
+      { username, email, password, role },
+      req.user.id
+    );
+    
+    res.status(201).json({
+      ok: true,
+      user
+    });
+  } catch (error) {
+    res.status(400).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Получение списка пользователей
+app.get('/api/v1/users', authJWT, async (req, res) => {
+  try {
+    const includeInactive = req.query.includeInactive === 'true';
+    const users = await userService.getAllUsers(includeInactive);
+    
+    res.json({
+      ok: true,
+      users
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Получение информации о пользователе
+app.get('/api/v1/users/:id', authJWT, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const user = await userService.getUserById(userId);
+    
+    if (!user) {
+      return res.status(404).json({ 
+        ok: false, 
+        error: 'Пользователь не найден' 
+      });
+    }
+    
+    res.json({
+      ok: true,
+      user
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Обновление пользователя
+app.put('/api/v1/users/:id', authJWT, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const updateData = req.body;
+    
+    const user = await userService.updateUser(userId, updateData, req.user.id);
+    
+    res.json({
+      ok: true,
+      user
+    });
+  } catch (error) {
+    res.status(400).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Смена пароля
+app.post('/api/v1/users/:id/change-password', authJWT, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    const { currentPassword, newPassword } = req.body;
+    
+    // Пользователь может менять только свой пароль (или superadmin любой)
+    if (req.user.id !== userId && req.user.role !== 'superadmin') {
+      return res.status(403).json({ 
+        ok: false, 
+        error: 'Недостаточно прав для смены пароля' 
+      });
+    }
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Требуются поля: currentPassword, newPassword' 
+      });
+    }
+    
+    await userService.changePassword(userId, currentPassword, newPassword);
+    
+    res.json({
+      ok: true,
+      message: 'Пароль успешно изменен'
+    });
+  } catch (error) {
+    res.status(400).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Деактивация пользователя
+app.delete('/api/v1/users/:id', authJWT, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    // Нельзя удалить самого себя
+    if (req.user.id === userId) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Нельзя удалить самого себя' 
+      });
+    }
+    
+    const user = await userService.deleteUser(userId);
+    
+    res.json({
+      ok: true,
+      message: 'Пользователь деактивирован',
+      user
+    });
+  } catch (error) {
+    res.status(400).json({ 
+      ok: false, 
+      error: error.message 
+    });
+  }
 });
 
 // Serve the frontend
 app.use('/', express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
+// ================== DEVICE SCHEDULE API ==================
+// Роли: только superadmin для модификации
+function requireSuperadmin(req, res, next) {
+  if (!req.user || req.user.role !== 'superadmin') return res.status(403).json({ ok: false, error: 'forbidden' });
+  next();
+}
+
+// List schedules
+app.get('/api/v1/device-schedules', authJWT, async (_req, res) => {
+  try {
+    const items = await prisma.deviceSchedule.findMany({ orderBy: [{ priority: 'desc' }, { id: 'asc' }] });
+    res.json({ ok: true, items });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Create schedule
+app.post('/api/v1/device-schedules', authJWT, requireSuperadmin, async (req, res) => {
+  try {
+    const { deviceId, windowStart, windowEnd, sceneCmd, offMode, priority, enabled } = req.body || {};
+    if (typeof windowStart !== 'number' || typeof windowEnd !== 'number') {
+      return res.status(400).json({ ok: false, error: 'windowStart/windowEnd required (minutes)' });
+    }
+    const item = await prisma.deviceSchedule.create({
+      data: {
+        deviceId: deviceId || null,
+        windowStart,
+        windowEnd,
+        sceneCmd: sceneCmd || 'SCENE 1',
+        offMode: offMode || 'OFF',
+        priority: priority ?? 0,
+        enabled: enabled !== false
+      }
+    });
+    res.status(201).json({ ok: true, item });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Update schedule
+app.put('/api/v1/device-schedules/:id', authJWT, requireSuperadmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const data = { ...req.body };
+    delete data.id;
+    const item = await prisma.deviceSchedule.update({ where: { id }, data });
+    res.json({ ok: true, item });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// Delete schedule
+app.delete('/api/v1/device-schedules/:id', authJWT, requireSuperadmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    await prisma.deviceSchedule.delete({ where: { id } });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+// =======================================================================
+
 const PORT = process.env.PORT || 8080;
 const server = app.listen(PORT, () => {
-  console.log(`lasers app running on :${PORT} (DB: ${DB_PATH})`);
+  console.log(`lasers app running on :${PORT} (Prisma connected)`);
 });
 
 // Рекомендуется для стабильного long-poll за прокси
 server.keepAliveTimeout = 65000;
 server.headersTimeout   = 70000;
+
+// ================== SCHEDULER (DB-based) ==================
+// Таблица DeviceSchedule управляет расписаниями.
+// Поля: deviceId (nullable = * для всех), windowStart, windowEnd (минуты от полуночи), sceneCmd, offMode, priority, enabled.
+// Алгоритм:
+// 1. Ежemin: читаем все enabled записи.
+// 2. Для каждого устройства (из Device + из уникальных deviceId расписаний) находим подходящее правило с max priority,
+//    где текущее время попадает в окно (учитывая overnight если end <= start). Если rule.deviceId=null - wildcard fallback.
+// 3. Применяем SCENE (sceneCmd) или OFF (offMode) если состояние изменилось.
+
+const scheduleCacheState = new Map(); // deviceId -> 'SCENE' | 'OFF'
+
+function timeMinutesNow() {
+  const d = new Date();
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+function matchInWindow(mins, start, end) {
+  if (end <= start) { // overnight
+    return mins >= start || mins < end;
+  }
+  return mins >= start && mins < end;
+}
+
+function parseSceneCmd(sceneCmd) {
+  const parts = sceneCmd.trim().split(/\s+/);
+  const base = parts.shift()?.toUpperCase() || 'SCENE';
+  const valMaybe = parts[0] && !isNaN(parseInt(parts[0], 10)) ? parseInt(parts[0], 10) : undefined;
+  return { base, valMaybe };
+}
+
+async function applyScheduleForDevice(deviceId, rule, target) {
+  const current = scheduleCacheState.get(deviceId);
+  if (current === target) return;
+  try {
+    if (target === 'SCENE') {
+      const { base, valMaybe } = parseSceneCmd(rule.sceneCmd);
+      cancelOffMacro(deviceId);
+      await insertOne(deviceId, { cmd: base, val: valMaybe });
+    } else { // OFF
+      if (rule.offMode === 'OFF') {
+        startOffMacro(deviceId);
+      } else {
+        await insertOne(deviceId, { cmd: 'OFF' });
+      }
+    }
+    scheduleCacheState.set(deviceId, target);
+    console.log(`[schedule-db] ${deviceId} -> ${target} (rule ${rule.id})`);
+  } catch (e) {
+    console.warn('[schedule-db] failed for', deviceId, 'rule', rule.id, e.message);
+  }
+}
+
+async function runDbScheduleTick() {
+  const nowM = timeMinutesNow();
+  let rules = [];
+  try {
+    rules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
+  } catch (e) {
+    console.warn('[schedule-db] load error', e.message);
+    return;
+  }
+  if (!rules.length) return;
+
+  // Собрать список устройств: все из Device + явные deviceId правил (если их ещё нет в Device)
+  const deviceRows = await prisma.device.findMany({ select: { id: true }, take: 2000 });
+  const idSet = new Set(deviceRows.map(d => d.id));
+  for (const r of rules) { if (r.deviceId) idSet.add(r.deviceId); }
+  const allIds = Array.from(idSet);
+
+  for (const devId of allIds) {
+    // фильтруем правила по deviceId совпадающим или null (wildcard)
+    const applicable = rules.filter(r => !r.deviceId || r.deviceId === devId);
+    if (!applicable.length) continue;
+    // найти первое с подходящим окном (они уже отсортированы по priority desc)
+    let matched = null;
+    for (const r of applicable) {
+      if (matchInWindow(nowM, r.windowStart, r.windowEnd)) { matched = r; break; }
+    }
+    if (!matched) {
+      // Вне всех окон — нужно OFF по правилу с наибольшим priority (берём первое applicable как baseline)
+      const fallback = applicable[0];
+      await applyScheduleForDevice(devId, fallback, 'OFF');
+    } else {
+      await applyScheduleForDevice(devId, matched, 'SCENE');
+    }
+  }
+}
+
+// Запуск планировщика из БД: каждую минуту + мягкий старт
+setTimeout(runDbScheduleTick, 7000);
+setInterval(runDbScheduleTick, 60 * 1000);
+console.log('[schedule-db] enabled (DB driven)');
+// ========================================================================
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  await prisma.$disconnect();
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', async () => {
+  console.log('Shutting down gracefully...');
+  await prisma.$disconnect();
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
