@@ -61,6 +61,8 @@ model DeviceSchedule {
   offMode     String   @default("OFF") // OFF или SCENE_OFF
   priority    Int      @default(0)      // больше = важнее
   enabled     Boolean  @default(true)
+  startTime   String?  // строка HH:MM (приоритетнее windowStart если задано)
+  endTime     String?  // строка HH:MM (приоритетнее windowEnd если задано)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 

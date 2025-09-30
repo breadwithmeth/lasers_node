@@ -614,6 +614,8 @@ model DeviceSchedule {
   offMode     String   @default("OFF")   // OFF | SCENE_OFF
   priority    Int      @default(0)        // больше = важнее
   enabled     Boolean  @default(true)
+  startTime   String?  // HH:MM (если задано — используется вместо windowStart)
+  endTime     String?  // HH:MM (если задано — используется вместо windowEnd)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
@@ -641,8 +643,10 @@ model DeviceSchedule {
 ```json
 {
   "deviceId": "laser001",   // опционально, null или пропуск = для всех
-  "windowStart": 1380,       // минуты (23*60)
-  "windowEnd": 240,          // минуты (4*60)
+  "windowStart": 1380,       // минуты (23*60) — fallback если нет startTime
+  "windowEnd": 240,          // минуты (4*60) — fallback если нет endTime
+  "startTime": "23:00",     // опционально HH:MM (перекрывает windowStart)
+  "endTime": "04:00",       // опционально HH:MM (перекрывает windowEnd)
   "sceneCmd": "SCENE 1",    // строка
   "offMode": "OFF",         // OFF | SCENE_OFF
   "priority": 10,            // целое число (больше = важнее)
@@ -651,20 +655,20 @@ model DeviceSchedule {
 ```
 
 ### Пример сценария
-1. Общая ночная SCENE 1 для всех устройств:
+1. Общая ночная SCENE 1 для всех устройств (через HH:MM):
 ```json
 POST /api/v1/device-schedules
-{ "windowStart": 1380, "windowEnd": 240, "sceneCmd": "SCENE 1", "priority": 1 }
+{ "startTime": "23:00", "endTime": "04:00", "sceneCmd": "SCENE 1", "priority": 1 }
 ```
 2. Для устройства `laser007` своя SCENE 2 с приоритетом выше:
 ```json
 POST /api/v1/device-schedules
-{ "deviceId": "laser007", "windowStart": 1380, "windowEnd": 240, "sceneCmd": "SCENE 2", "priority": 5 }
+{ "deviceId": "laser007", "startTime": "23:00", "endTime": "04:00", "sceneCmd": "SCENE 2", "priority": 5 }
 ```
 3. Дневное окно выключения мгновенно (SCENE_OFF не использовать макрос):
 ```json
 POST /api/v1/device-schedules
-{ "windowStart": 480, "windowEnd": 1020, "sceneCmd": "SCENE 1", "offMode": "SCENE_OFF", "priority": 2 }
+{ "startTime": "08:00", "endTime": "17:00", "sceneCmd": "SCENE 1", "offMode": "SCENE_OFF", "priority": 2 }
 ```
 
 ### Поведение OFF

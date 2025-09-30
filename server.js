@@ -426,15 +426,19 @@ app.get('/api/v1/devices', authAdmin, async (_req, res) => {
 
   // Загружаем enabled расписания для подсчёта признаков
   const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
-  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  const nowM = timeMinutesNow();
   function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
 
   const list = deviceRows.map(dv => {
     const agg = aggMap.get(dv.id);
     const runtime = devices.get(dv.id);
-    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === dv.id);
+    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === dv.id).map(r => {
+      const s = hhmmToMinutes(r.startTime) ?? r.windowStart;
+      const e = hhmmToMinutes(r.endTime) ?? r.windowEnd;
+      return { ...r, _start: s, _end: e };
+    });
     const hasSchedule = rulesFor.length > 0;
-    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r._start, r._end));
     return {
       id: dv.id,
       lat: dv.lat,
@@ -493,10 +497,11 @@ app.get('/api/v1/device/:id', authAdmin, async (req, res) => {
   if (!dev) return res.status(404).json({ ok: false, error: 'device not found' });
   const agg = await prisma.event.findFirst({ where: { device: id }, orderBy: { id: 'desc' }, select: { id: true, ts: true } });
   const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true, OR: [ { deviceId: id }, { deviceId: null } ] }, orderBy: { priority: 'desc' } });
-  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  const nowM = timeMinutesNow();
   function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
-  const hasSchedule = schedRules.length>0;
-  const scheduleActive = hasSchedule && schedRules.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+  const normRules = schedRules.map(r => ({ ...r, _start: hhmmToMinutes(r.startTime) ?? r.windowStart, _end: hhmmToMinutes(r.endTime) ?? r.windowEnd }));
+  const hasSchedule = normRules.length>0;
+  const scheduleActive = hasSchedule && normRules.some(r => matchInWindow(nowM, r._start, r._end));
   res.json({
     ok: true,
     device: {
@@ -542,12 +547,12 @@ app.get('/api/v1/devices/coords', authAdmin, async (_req, res) => {
     select: { id: true, lat: true, lon: true, lastSeenAt: true }
   });
   const schedRules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
-  const nowM = (() => { const d=new Date(); return d.getHours()*60 + d.getMinutes(); })();
+  const nowM = timeMinutesNow();
   function matchInWindow(mins, start, end){ return end <= start ? (mins >= start || mins < end) : (mins >= start && mins < end); }
   const mapped = devicesRows.map(d => {
-    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === d.id);
+    const rulesFor = schedRules.filter(r => !r.deviceId || r.deviceId === d.id).map(r => ({ ...r, _start: hhmmToMinutes(r.startTime) ?? r.windowStart, _end: hhmmToMinutes(r.endTime) ?? r.windowEnd }));
     const hasSchedule = rulesFor.length>0;
-    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r.windowStart, r.windowEnd));
+    const scheduleActive = hasSchedule && rulesFor.some(r => matchInWindow(nowM, r._start, r._end));
     return {
       id: d.id,
       lat: d.lat,
@@ -558,6 +563,34 @@ app.get('/api/v1/devices/coords', authAdmin, async (_req, res) => {
     };
   });
   res.json({ devices: mapped });
+});
+
+// Текущий статус расписания по устройствам: какое правило активно / следующая цель
+app.get('/api/v1/device-schedules/status', authAdmin, async (_req, res) => {
+  try {
+    const nowM = timeMinutesNow();
+    const rules = await prisma.deviceSchedule.findMany({ where: { enabled: true }, orderBy: { priority: 'desc' } });
+    const norm = rules.map(r => ({ ...r, _start: hhmmToMinutes(r.startTime) ?? r.windowStart, _end: hhmmToMinutes(r.endTime) ?? r.windowEnd }));
+    const deviceRows = await prisma.device.findMany({ select: { id: true }, take: 2000 });
+    const idSet = new Set(deviceRows.map(d => d.id));
+    for (const r of norm) if (r.deviceId) idSet.add(r.deviceId);
+    const result = [];
+    for (const id of Array.from(idSet)) {
+      const applicable = norm.filter(r => !r.deviceId || r.deviceId === id);
+      if (!applicable.length) continue;
+      let active = null;
+      for (const r of applicable) { if (matchInWindow(nowM, r._start, r._end)) { active = r; break; } }
+      if (active) {
+        result.push({ deviceId: id, state: 'SCENE', sceneCmd: active.sceneCmd, ruleId: active.id });
+      } else {
+        const fb = applicable[0];
+        result.push({ deviceId: id, state: 'OFF', offMode: fb.offMode, viaRuleId: fb.id });
+      }
+    }
+    res.json({ ok: true, nowMinutes: nowM, items: result });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // Аутентификация пользователя
@@ -785,15 +818,29 @@ app.get('/api/v1/device-schedules', authJWT, async (_req, res) => {
 // Create schedule
 app.post('/api/v1/device-schedules', authJWT, requireSuperadmin, async (req, res) => {
   try {
-    const { deviceId, windowStart, windowEnd, sceneCmd, offMode, priority, enabled } = req.body || {};
-    if (typeof windowStart !== 'number' || typeof windowEnd !== 'number') {
-      return res.status(400).json({ ok: false, error: 'windowStart/windowEnd required (minutes)' });
+    const { deviceId, windowStart, windowEnd, sceneCmd, offMode, priority, enabled, startTime, endTime } = req.body || {};
+
+    function parseHHMM(str){
+      if(!str) return null; const m=str.match(/^(\d{1,2}):(\d{2})$/); if(!m) return null; const h=+m[1], mn=+m[2]; if(h>23||mn>59) return null; return h*60+mn; }
+
+    let wStart = windowStart;
+    let wEnd = windowEnd;
+    if ((startTime || endTime) && (typeof wStart !== 'number' || typeof wEnd !== 'number')) {
+      // Если переданы HH:MM и не переданы минутные поля — вычислим
+      const ps = parseHHMM(startTime); const pe = parseHHMM(endTime);
+      if (ps == null || pe == null) return res.status(400).json({ ok:false, error:'invalid startTime/endTime format HH:MM' });
+      wStart = ps; wEnd = pe;
+    }
+    if (typeof wStart !== 'number' || typeof wEnd !== 'number') {
+      return res.status(400).json({ ok:false, error:'Provide either windowStart/windowEnd (minutes) or startTime/endTime (HH:MM)' });
     }
     const item = await prisma.deviceSchedule.create({
       data: {
         deviceId: deviceId || null,
-        windowStart,
-        windowEnd,
+        windowStart: wStart,
+        windowEnd: wEnd,
+        startTime: startTime || null,
+        endTime: endTime || null,
         sceneCmd: sceneCmd || 'SCENE 1',
         offMode: offMode || 'OFF',
         priority: priority ?? 0,
@@ -810,9 +857,17 @@ app.post('/api/v1/device-schedules', authJWT, requireSuperadmin, async (req, res
 app.put('/api/v1/device-schedules/:id', authJWT, requireSuperadmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const data = { ...req.body };
-    delete data.id;
-    const item = await prisma.deviceSchedule.update({ where: { id }, data });
+    const body = { ...req.body };
+    delete body.id;
+    function parseHHMM(str){
+      if(!str) return null; const m=str.match(/^(\d{1,2}):(\d{2})$/); if(!m) return null; const h=+m[1], mn=+m[2]; if(h>23||mn>59) return null; return h*60+mn; }
+    // Если приходят startTime/endTime и не приходят windowStart/windowEnd — вычислим
+    if ((body.startTime || body.endTime) && (body.windowStart === undefined && body.windowEnd === undefined)) {
+      const ps = parseHHMM(body.startTime); const pe = parseHHMM(body.endTime);
+      if (ps == null || pe == null) return res.status(400).json({ ok:false, error:'invalid startTime/endTime format HH:MM' });
+      body.windowStart = ps; body.windowEnd = pe;
+    }
+    const item = await prisma.deviceSchedule.update({ where: { id }, data: body });
     res.json({ ok: true, item });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -849,11 +904,15 @@ server.headersTimeout   = 70000;
 //    где текущее время попадает в окно (учитывая overnight если end <= start). Если rule.deviceId=null - wildcard fallback.
 // 3. Применяем SCENE (sceneCmd) или OFF (offMode) если состояние изменилось.
 
-const scheduleCacheState = new Map(); // deviceId -> 'SCENE' | 'OFF'
+const scheduleCacheState = new Map(); // deviceId -> { mode: 'SCENE'|'OFF', sceneCmd?: string }
 
+// Используем фиксированный часовой пояс UTC+5 (требование пользователя)
+// Можно вынести в ENV позже: SCHEDULE_TZ_OFFSET_MINUTES
+const SCHEDULE_TZ_OFFSET_MINUTES = 5 * 60; // +5 часов
 function timeMinutesNow() {
   const d = new Date();
-  return d.getHours() * 60 + d.getMinutes();
+  const utcMinutes = d.getUTCHours() * 60 + d.getUTCMinutes();
+  return (utcMinutes + SCHEDULE_TZ_OFFSET_MINUTES) % 1440;
 }
 
 function matchInWindow(mins, start, end) {
@@ -861,6 +920,15 @@ function matchInWindow(mins, start, end) {
     return mins >= start || mins < end;
   }
   return mins >= start && mins < end;
+}
+
+function hhmmToMinutes(hhmm) {
+  if (!hhmm) return null;
+  const m = hhmm.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1],10); const mn = parseInt(m[2],10);
+  if (h<0||h>23||mn<0||mn>59) return null;
+  return h*60+mn;
 }
 
 function parseSceneCmd(sceneCmd) {
@@ -872,21 +940,24 @@ function parseSceneCmd(sceneCmd) {
 
 async function applyScheduleForDevice(deviceId, rule, target) {
   const current = scheduleCacheState.get(deviceId);
-  if (current === target) return;
+  let need = false;
+  if (!current) need = true; else if (current.mode !== target) need = true; else if (target === 'SCENE' && current.sceneCmd !== rule.sceneCmd) need = true;
+  if (!need) return;
   try {
     if (target === 'SCENE') {
       const { base, valMaybe } = parseSceneCmd(rule.sceneCmd);
       cancelOffMacro(deviceId);
       await insertOne(deviceId, { cmd: base, val: valMaybe });
+      scheduleCacheState.set(deviceId, { mode: 'SCENE', sceneCmd: rule.sceneCmd });
     } else { // OFF
       if (rule.offMode === 'OFF') {
         startOffMacro(deviceId);
       } else {
         await insertOne(deviceId, { cmd: 'OFF' });
       }
+      scheduleCacheState.set(deviceId, { mode: 'OFF' });
     }
-    scheduleCacheState.set(deviceId, target);
-    console.log(`[schedule-db] ${deviceId} -> ${target} (rule ${rule.id})`);
+    console.log(`[schedule-db] ${deviceId} -> ${target}${target==='SCENE'?(' '+rule.sceneCmd):''} (rule ${rule.id})`);
   } catch (e) {
     console.warn('[schedule-db] failed for', deviceId, 'rule', rule.id, e.message);
   }
@@ -903,6 +974,13 @@ async function runDbScheduleTick() {
   }
   if (!rules.length) return;
 
+  // Преобразуем возможные HH:MM поля в минуты (если заданы — заменяют windowStart/windowEnd)
+  const normRules = rules.map(r => {
+    const s = hhmmToMinutes(r.startTime) ?? r.windowStart;
+    const e = hhmmToMinutes(r.endTime) ?? r.windowEnd;
+    return { ...r, _start: s, _end: e };
+  });
+
   // Собрать список устройств: все из Device + явные deviceId правил (если их ещё нет в Device)
   const deviceRows = await prisma.device.findMany({ select: { id: true }, take: 2000 });
   const idSet = new Set(deviceRows.map(d => d.id));
@@ -911,12 +989,12 @@ async function runDbScheduleTick() {
 
   for (const devId of allIds) {
     // фильтруем правила по deviceId совпадающим или null (wildcard)
-    const applicable = rules.filter(r => !r.deviceId || r.deviceId === devId);
+    const applicable = normRules.filter(r => !r.deviceId || r.deviceId === devId);
     if (!applicable.length) continue;
     // найти первое с подходящим окном (они уже отсортированы по priority desc)
     let matched = null;
     for (const r of applicable) {
-      if (matchInWindow(nowM, r.windowStart, r.windowEnd)) { matched = r; break; }
+      if (matchInWindow(nowM, r._start, r._end)) { matched = r; break; }
     }
     if (!matched) {
       // Вне всех окон — нужно OFF по правилу с наибольшим priority (берём первое applicable как baseline)
@@ -928,10 +1006,10 @@ async function runDbScheduleTick() {
   }
 }
 
-// Запуск планировщика из БД: каждую минуту + мягкий старт
-setTimeout(runDbScheduleTick, 7000);
+// Запуск планировщика из БД: немедленно и затем каждую минуту
+runDbScheduleTick();
 setInterval(runDbScheduleTick, 60 * 1000);
-console.log('[schedule-db] enabled (DB driven)');
+console.log('[schedule-db] enabled (DB driven, immediate start)');
 // ========================================================================
 
 // Graceful shutdown
