@@ -248,8 +248,7 @@ app.get('/api/v1/poll', async (req, res) => {
   // --- DB: берём пачку и возвращаем только последнюю ---
   const fromDb = await prisma.event.findMany({
     where: {
-      device,
-      id: { gt: cursor }
+      device
     },
     orderBy: { id: 'asc' },
     take: 200
