@@ -11,6 +11,66 @@ app.set('trust proxy', true);
 app.use(express.json({ limit: '256kb' }));
 app.use(cors());
 
+// ================== REQUEST LOGGING ==================
+// Включается переменной окружения LOG_REQUESTS=true
+// Формат: ISO | ip | method path -> status code (ms) sizeB user=<id|-> extra
+// Маскирует чувствительные поля (password, currentPassword, newPassword)
+const LOG_REQUESTS = /^true$/i.test(process.env.LOG_REQUESTS || '');
+if (LOG_REQUESTS) {
+  app.use((req, res, next) => {
+    const started = process.hrtime.bigint();
+    const { method } = req;
+    const url = req.originalUrl || req.url;
+    const ip = req.ip || req.connection?.remoteAddress || '-';
+    // Снимок тела (только для JSON и небольшого размера)
+    let bodyPreview = null;
+    if (req.is('application/json') && req.body && typeof req.body === 'object') {
+      const clone = { ...req.body };
+      for (const k of ['password','currentPassword','newPassword']) {
+        if (k in clone) clone[k] = '***';
+      }
+      // не логируем длинные payload > 2KB
+      const str = JSON.stringify(clone);
+      if (str.length < 2048) bodyPreview = str; else bodyPreview = `{"_truncated":${str.length}}`;
+    }
+    const referer = req.get('referer') || '';
+    const ua = req.get('user-agent') || '';
+    const chunks = [];
+    const origWrite = res.write;
+    const origEnd = res.end;
+    let bytes = 0;
+    res.write = function(chunk, encoding, cb) {
+      if (chunk) {
+        const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding || 'utf8');
+        bytes += b.length;
+      }
+      return origWrite.call(this, chunk, encoding, cb);
+    };
+    res.end = function(chunk, encoding, cb) {
+      if (chunk) {
+        const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding || 'utf8');
+        bytes += b.length;
+      }
+      return origEnd.call(this, chunk, encoding, cb);
+    };
+    res.on('finish', () => {
+      const ns = process.hrtime.bigint() - started;
+      const ms = (Number(ns) / 1e6).toFixed(1);
+      const status = res.statusCode;
+      const userId = (req.user && req.user.id) ? req.user.id : '-';
+      const sched = url.includes('/device-schedules') ? 'sched' : '';
+      const device = req.query?.device || req.params?.id || '';
+      const extra = [device && `device=${device}`, bodyPreview && `body=${bodyPreview}`, sched, referer && `ref=${referer}`, ua && `ua=${ua}`]
+        .filter(Boolean)
+        .join(' ');
+      console.log(`${new Date().toISOString()} | ${ip} | ${method} ${url} -> ${status} (${ms}ms ${bytes}B) user=${userId}${extra?(' '+extra):''}`);
+    });
+    next();
+  });
+  console.log('[request-log] enabled');
+}
+// ======================================================
+
 // --- Prisma ---
 const prisma = new PrismaClient();
 const userService = new UserService(prisma);
