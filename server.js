@@ -245,30 +245,30 @@ app.get('/api/v1/poll', async (req, res) => {
   //   return res.json({ events: [lastEv], cursor: String(d.lastId) });
   // }
 
-  // --- DB: берём пачку и возвращаем только последнюю ---
-  const fromDb = await prisma.event.findMany({
+  // --- DB: берём только последний event c id > cursor ---
+  const lastRow = await prisma.event.findFirst({
     where: {
-      device
+      device,
+      id: { gt: cursor }
     },
-    orderBy: { id: 'asc' },
-    take: 200
+    orderBy: { id: 'desc' }
   });
 
-  const mappedEvents = fromDb.map(r => ({ 
-    id: r.id, 
-    ts: r.ts, 
-    ...JSON.parse(r.payload) 
-  }));
-
-  if (mappedEvents.length) {
-    const lastEv = mappedEvents[mappedEvents.length - 1];
-
-    // подогреваем in-memory хвост только последним (не обязательно, но аккуратнее по памяти)
+  if (lastRow) {
+    const lastEv = { id: lastRow.id, ts: lastRow.ts, ...JSON.parse(lastRow.payload) };
     d.queue.push(lastEv);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
-
     d.lastId = lastEv.id;
-    return res.json({ events: [lastEv], cursor: String(d.lastId) });
+    // Формируем «обрезанный» ответ без id/ts/cursor
+    const { cmd, args, val, num, raw, ...rest } = lastEv;
+    const sanitized = {};
+    if (cmd !== undefined) sanitized.cmd = cmd;
+    if (args !== undefined) sanitized.args = args;
+    if (val !== undefined) sanitized.val = val;
+    if (num !== undefined) sanitized.num = num;
+    if (raw !== undefined) sanitized.raw = raw;
+    // rest содержит служебные поля (id, ts) игнорируем по задаче
+    return res.json({ events: [sanitized] });
   }
 
   // --- ничего нет — держим соединение (long-poll) ---
@@ -276,7 +276,8 @@ app.get('/api/v1/poll', async (req, res) => {
   const timer = setTimeout(() => {
     finished = true;
     d.waiters.delete(res);
-    res.status(204).end();
+    // Вместо 204 всегда возвращаем одинаковый формат
+    res.json({ events: [] });
   }, wait * 1000);
 
   req.on('close', () => {
