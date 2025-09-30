@@ -260,7 +260,13 @@ app.get('/api/v1/poll', async (req, res) => {
       payload.args = String(payload.val);
       delete payload.val; // чтобы не дублировать
     }
-    const lastEv = { id: lastRow.id, ts: lastRow.ts, ...payload };
+    let lastEv;
+    if (payload && payload.cmd === 'OFF') {
+      // Требование: для OFF возвращаем только саму команду без мета
+      lastEv = { cmd: 'OFF' };
+    } else {
+      lastEv = { id: lastRow.id, ts: lastRow.ts, ...payload };
+    }
     d.queue.push(lastEv);
     if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
     d.lastId = lastEv.id;
