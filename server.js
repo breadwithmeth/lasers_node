@@ -248,8 +248,7 @@ app.get('/api/v1/poll', async (req, res) => {
   // --- DB: берём только последний event c id > cursor ---
   const lastRow = await prisma.event.findFirst({
     where: {
-      device,
-      id: { gt: cursor }
+      device
     },
     orderBy: { id: 'desc' }
   });
