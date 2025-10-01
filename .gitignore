@@ -2,5 +2,11 @@
 /events.db
 /events.db-shm
 /events.db-wal
+
+# Generic SQLite artifacts (чтобы не закоммитить другие временные базы)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
 /node_modules
 /generated/prisma

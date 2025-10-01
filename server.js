@@ -245,40 +245,50 @@ app.get('/api/v1/poll', async (req, res) => {
   //   return res.json({ events: [lastEv], cursor: String(d.lastId) });
   // }
 
-  // --- DB: берём только последний event c id > cursor ---
-  const lastRow = await prisma.event.findFirst({
-    where: {
-      device
-    },
-    orderBy: { id: 'desc' }
-  });
+  const COMMAND_RETENTION_MS = 5 * 60 * 1000; // 5 минут доступности последней команды
+  const lastRow = await prisma.event.findFirst({ where: { device }, orderBy: { id: 'desc' } });
 
   if (lastRow) {
+    const lastId = lastRow.id;
+    const lastTsMs = Date.parse(lastRow.ts);
+    const ageMs = Date.now() - lastTsMs;
     const payload = JSON.parse(lastRow.payload);
-    // Преобразуем SCENE val -> args если нужно под формат примера
     if (payload && payload.cmd === 'SCENE' && payload.val != null && payload.args === undefined) {
       payload.args = String(payload.val);
-      delete payload.val; // чтобы не дублировать
+      delete payload.val;
     }
-    let lastEv;
+    let shaped;
     if (payload && payload.cmd === 'OFF') {
-      // Требование: для OFF возвращаем только саму команду без мета
-      lastEv = { cmd: 'OFF' };
+      shaped = { cmd: 'OFF' };
     } else {
-      lastEv = { id: lastRow.id, ts: lastRow.ts, ...payload };
+      shaped = { id: lastRow.id, ts: lastRow.ts, ...payload };
     }
-    d.queue.push(lastEv);
-    if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
-    d.lastId = lastEv.id;
-    return res.json({ events: [lastEv], cursor: String(d.lastId) });
+
+    if (lastId > cursor) {
+      // Новое событие для клиента — отдаем
+      d.queue.push(shaped);
+      if (d.queue.length > d.maxQueue) d.queue = d.queue.slice(-d.maxQueue);
+      d.lastId = lastId;
+      return res.json({ events: [shaped], cursor: String(lastId) });
+    }
+
+    // Нет новых событий (lastId <= cursor)
+    if (ageMs <= COMMAND_RETENTION_MS) {
+      // В течение retention периода повторно выдаем последнюю команду (даже если клиент её видел)
+      return res.json({ events: [shaped], cursor: String(lastId) });
+    }
+    // Иначе ждём появления новых и по таймауту 204
+  } else {
+    // Нет ни одного события — просто ждём
   }
 
-  // --- ничего нет — держим соединение (long-poll) ---
+  // --- держим соединение (long-poll) ---
   let finished = false;
   const timer = setTimeout(() => {
     finished = true;
     d.waiters.delete(res);
-    res.json({ events: [], cursor: String(cursor) });
+    // Если за время ожидания ничего не появилось и последнее событие (если было) уже старше retention — 204
+    res.status(204).end();
   }, wait * 1000);
 
   req.on('close', () => {
