@@ -245,7 +245,7 @@ app.get('/api/v1/poll', async (req, res) => {
   //   return res.json({ events: [lastEv], cursor: String(d.lastId) });
   // }
 
-  const COMMAND_RETENTION_MS = 5 * 60 * 1000; // 5 минут доступности последней команды
+  const COMMAND_RETENTION_MS = 1 * 60 * 1000; // 5 минут доступности последней команды
   const lastRow = await prisma.event.findFirst({ where: { device }, orderBy: { id: 'desc' } });
 
   if (lastRow) {
