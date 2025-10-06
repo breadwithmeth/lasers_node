@@ -419,6 +419,39 @@ app.post('/api/v1/device/:id/custom', authAdmin, async (req, res) => {
   }
 });
 
+// Telemetry: приём статуса лазера (без авторизации, т.к. постит само устройство)
+// POST /api/v1/device/:id/state
+// Body: { state: "OK" | "DEVIATION", deviation?: number }
+app.post('/api/v1/device/:id/state', async (req, res) => {
+  try {
+    const device = req.params.id?.trim();
+    if (!device) return res.status(400).json({ ok: false, error: 'device required' });
+
+  const { state, deviation } = req.body || {};
+  let normState = String(state || '').trim().toUpperCase();
+  // Поддержка кириллического варианта "ОК"
+  if (normState === 'ОК') normState = 'OK';
+    if (!normState) return res.status(400).json({ ok: false, error: 'state required' });
+    if (!['OK', 'DEVIATION'].includes(normState)) {
+      return res.status(400).json({ ok: false, error: 'invalid state (allowed: OK, DEVIATION)' });
+    }
+
+    // Обновляем/регистрируем устройство и lastSeenAt
+    await getDevice(device); // создаст при необходимости
+    prisma.device.update({ where: { id: device }, data: { lastSeenAt: new Date() } }).catch(() => {});
+
+    const devVal = typeof deviation === 'number' && Number.isFinite(deviation)
+      ? deviation
+      : (deviation != null && !Number.isNaN(Number(deviation)) ? Number(deviation) : undefined);
+
+    const row = { cmd: 'STATUS', state: normState, deviation: devVal };
+    const ev = await insertOne(device, row);
+    return res.json({ ok: true, event: ev });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Simple device list (from DB + runtime lastSeen)
 app.get('/api/v1/devices', authAdmin, async (_req, res) => {
   // Берём данные об устройствах
