@@ -560,6 +560,38 @@ app.get('/api/v1/device/:id', authAdmin, async (req, res) => {
   });
 });
 
+// Получить последний статус (STATUS) устройства — только для админа
+app.get('/api/v1/device/:id/status', authAdmin, async (req, res) => {
+  try {
+    const id = req.params.id.trim();
+    if (!id) return res.status(400).json({ ok: false, error: 'device required' });
+
+    const dev = await prisma.device.findUnique({ where: { id } });
+    if (!dev) return res.status(404).json({ ok: false, error: 'device not found' });
+
+    // Ищем последнее событие с cmd: 'STATUS'
+    const events = await prisma.event.findMany({
+      where: { device: id },
+      orderBy: { id: 'desc' },
+      take: 200
+    });
+    let status = null;
+    for (const e of events) {
+      try {
+        const p = JSON.parse(e.payload);
+        if (p && p.cmd === 'STATUS') {
+          status = { id: e.id, ts: e.ts, state: p.state, deviation: p.deviation };
+          break;
+        }
+      } catch (_) {}
+    }
+
+    return res.json({ ok: true, deviceId: id, status });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Обновить координаты устройства (partial)
 app.put('/api/v1/device/:id', authAdmin, async (req, res) => {
   const id = req.params.id;
